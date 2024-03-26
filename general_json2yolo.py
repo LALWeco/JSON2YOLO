@@ -5,8 +5,12 @@ import cv2
 import pandas as pd
 from PIL import Image
 from collections import defaultdict
-
+import logging
+from pycocotools import mask as cocomask
 from utils import *
+import numpy as np
+import copy
+import os
 
 
 # Convert INFOLKS JSON file into YOLO-format labels ----------------------------
@@ -253,15 +257,19 @@ def convert_ath_json(json_dir):  # dir contains json annotations and images
     print(f"Done. Output saved to {Path(dir).absolute()}")
 
 
-def convert_coco_json(json_dir="../coco/annotations/", use_segments=False, cls91to80=False):
+def convert_coco_json(json_dir="../coco/annotations/", 
+                      save_dir="s", 
+                      use_segments=False,
+                      cls91to80=True):
     """Converts COCO JSON format to YOLO label format, with options for segments and class mapping."""
-    save_dir = make_dirs()  # output directory
     coco80 = coco91_to_coco80_class()
+    os.makedirs(save_dir, exist_ok=True)
+    # os.makedirs(Path(save_dir) / "labels", exist_ok=True)
 
     # Import json
     for json_file in sorted(Path(json_dir).resolve().glob("*.json")):
         fn = Path(save_dir) / "labels" / json_file.stem.replace("instances_", "")  # folder name
-        fn.mkdir()
+        fn.mkdir(parents=True, exist_ok=True)  # make dir
         with open(json_file) as f:
             data = json.load(f)
 
@@ -272,6 +280,58 @@ def convert_coco_json(json_dir="../coco/annotations/", use_segments=False, cls91
         for ann in data["annotations"]:
             imgToAnns[ann["image_id"]].append(ann)
 
+        # Good read on this topic RLE segmentation to COCO polygons https://github.com/ultralytics/JSON2YOLO/issues/38
+        # https://stackoverflow.com/a/75326289
+        def rle_to_coco(annotation: dict) -> list:
+            """Transform the rle coco annotation (a single one) into coco style.
+            In this case, one mask can contain several polygons, later leading to several `Annotation` objects.
+            In case of not having a valid polygon (the mask is a single pixel) it will be an empty list.
+            Parameters
+            ----------
+            annotation : dict
+                rle coco style annotation
+            Returns
+            -------
+            list[dict]
+                list of coco style annotations (in dict format)
+            """
+
+            annotation["segmentation"] = cocomask.frPyObjects(
+                annotation["segmentation"],
+                annotation["segmentation"]["size"][0],
+                annotation["segmentation"]["size"][1],
+            )
+
+            maskedArr = cocomask.decode(annotation["segmentation"])
+            contours, _ = cv2.findContours(maskedArr, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            segmentation = []
+
+            for contour in contours:
+                if contour.size >= 6:
+                    segmentation.append(contour)
+
+            if len(segmentation) == 0:
+                logging.debug(
+                    f"Annotation with id {annotation['id']} is not valid, it has no segmentations."
+                )
+                annotations = []
+
+            else:
+                annotations = list()
+                for i, seg in enumerate(segmentation):
+
+                    single_annotation = copy.deepcopy(annotation)
+                    single_annotation["segmentation_coords"] = (
+                        seg.astype(float).flatten().tolist()
+                    )
+                    single_annotation["bbox"] = list(cv2.boundingRect(seg))
+                    single_annotation["area"] = cv2.contourArea(seg)
+                    single_annotation["instance_id"] = annotation["id"]
+                    single_annotation["annotation_id"] = f"{annotation['id']}_{i}"
+
+                    annotations.append(single_annotation)
+
+            return annotations
         # Write labels file
         for img_id, anns in tqdm(imgToAnns.items(), desc=f"Annotations {json_file}"):
             img = images["%g" % img_id]
@@ -280,8 +340,8 @@ def convert_coco_json(json_dir="../coco/annotations/", use_segments=False, cls91
             bboxes = []
             segments = []
             for ann in anns:
-                if ann["iscrowd"]:
-                    continue
+                # if ann["iscrowd"]:
+                #     continue
                 # The COCO box format is [top left x, top left y, width, height]
                 box = np.array(ann["bbox"], dtype=np.float64)
                 box[:2] += box[2:] / 2  # xy top-left corner to center
@@ -296,13 +356,21 @@ def convert_coco_json(json_dir="../coco/annotations/", use_segments=False, cls91
                     bboxes.append(box)
                 # Segments
                 if use_segments:
-                    if len(ann["segmentation"]) > 1:
-                        s = merge_multi_segment(ann["segmentation"])
-                        s = (np.concatenate(s, axis=0) / np.array([w, h])).reshape(-1).tolist()
+                    ann["segmentation"] = rle_to_coco(ann)
+                    if len(ann["segmentation"]) > 1:    # Multiple disjointed segments in one mask
+                        s = [seg['segmentation_coords'] for seg in ann["segmentation"]]
+                        s = [np.array(seg).reshape(-1, 2)/np.array([w, h]) for seg in s]
+                        s = np.concatenate(s, axis=0).reshape(-1).tolist()
                     else:
-                        s = [j for i in ann["segmentation"] for j in i]  # all segments concatenated
-                        s = (np.array(s).reshape(-1, 2) / np.array([w, h])).reshape(-1).tolist()
-                    s = [cls] + s
+                        if len(ann["segmentation"]) == 0:
+                            # TODO Weird case where the segmentation is empty
+                            s = ann['bbox']  # all segments concatenated
+                            s = (np.array(s).reshape(-1, 2) / np.array([w, h])).reshape(-1).tolist()
+                        else:
+                            assert len(ann["segmentation"]) == 1
+                            s = ann['segmentation'][0]['segmentation_coords']  # all segments concatenated
+                            s = (np.array(s).reshape(-1, 2) / np.array([w, h])).reshape(-1).tolist()
+                    s = [cls -1] + s            # coco classes are 1-based, so we subtract 1 and make it zero indexed for YOLO format
                     if s not in segments:
                         segments.append(s)
 
@@ -391,7 +459,8 @@ if __name__ == "__main__":
 
     if source == "COCO":
         convert_coco_json(
-            "../datasets/coco/annotations",  # directory with *.json
+            "/mnt/d/datasets/lalweco/lalweco_dataset/datumaro_dataset",  # directory with *.json
+            "/mnt/d/datasets/lalweco/lalweco_dataset/datumaro_dataset/yolo_segmentation",  # output directory
             use_segments=True,
             cls91to80=True,
         )
