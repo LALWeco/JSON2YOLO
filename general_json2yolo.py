@@ -7,7 +7,7 @@ from PIL import Image
 from collections import defaultdict
 import logging
 from pycocotools import mask as cocomask
-from utils import *
+from .utils import *
 import numpy as np
 import copy
 import os
