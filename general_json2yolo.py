@@ -268,7 +268,7 @@ def convert_coco_json(json_dir="../coco/annotations/",
 
     # Import json
     for json_file in sorted(Path(json_dir).resolve().glob("instances_*.json")): # TODO! Does this break things with keypoints?
-        fn = Path(save_dir) / "labels" / json_file.stem.replace("instances_", "")  # folder name
+        fn = Path(save_dir) / "labels_seg" / json_file.stem.replace("instances_", "")  # folder name
         fn.mkdir(parents=True, exist_ok=True)  # make dir
         with open(json_file) as f:
             data = json.load(f)
